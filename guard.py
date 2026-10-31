@@ -80,6 +80,9 @@ def api(method, path, params=None, body=None):
     })
     with urllib.request.urlopen(req, timeout=30) as resp:
         raw = resp.read()
+        if raw and "html" in resp.headers.get("Content-Type", ""):
+            raise RuntimeError(f"{JELLYFIN} answered with a web page, not the API. If Jellyfin has a "
+                               "base URL (Dashboard > Networking), add it to JELLYFIN_URL")
     return json.loads(raw) if raw else None
 
 
