@@ -1,0 +1,26 @@
+# Keeps Jellyfin's one-time Live TV recordings from being lost on a guide refresh.
+# Settings come from .env (copy .env.example to .env and fill it in).
+services:
+  dvr-guard:
+    image: python:3.12-alpine
+    container_name: dvr-guard
+    restart: unless-stopped
+    user: "${PUID:?set PUID in .env}:${PGID:?set PGID in .env}"
+    command: ["python", "-u", "/app/guard.py"]
+    environment:
+      - JELLYFIN_URL=${JELLYFIN_URL:?set JELLYFIN_URL in .env}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:?set JELLYFIN_API_KEY in .env}
+      - SOURCE_M3U=${SOURCE_M3U:-}
+      - FALLBACK_EXTRA_MINUTES=${FALLBACK_EXTRA_MINUTES:-30}
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ./guard.py:/app/guard.py:ro
+      - ./data:/data
+      - ${RECORD_DIR:?set RECORD_DIR in .env}:/recordings
+    networks:
+      - jellyfin
+
+networks:
+  jellyfin:
+    name: ${DOCKER_NETWORK:?set DOCKER_NETWORK in .env}
+    external: true

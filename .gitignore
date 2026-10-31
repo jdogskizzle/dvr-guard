@@ -1,0 +1,7 @@
+# Local settings
+.env
+
+# Saved recordings list
+/data/
+
+__pycache__/
