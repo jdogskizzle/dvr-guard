@@ -59,6 +59,9 @@ async function api(path, body) {
   return r.json();
 }
 
+function conflict(r) {
+  return r.conflict ? `<span class="tag rec" title="Too many recordings at once: cancel one, or the later ones wait for a free tuner">${esc(r.conflict)}</span>` : "";
+}
 function gaps(r) {
   const g = (r.gaps || []).reduce((a, x) => a + x[1], 0);
   return g ? `<span class="tag warn" title="${(r.gaps || []).map(x => `${time(x[0])}: ${x[1]}s`).join(", ")}">${g}s missing</span>` : "";
@@ -72,7 +75,7 @@ async function draw() {
   const done = recs.filter(r => !["recording", "scheduled"].includes(r.status)).reverse().slice(0, 30);
   $("#now").innerHTML = rec.length ? rec.map(r => `<div class="item"><div class="grow"><b>${title(r)}</b>
       <span class="dim">${esc(r.channel)} ${esc(r.channel_name)} · until ${time(ends(r))} · <span class="mono">${gb(r.bytes)}</span></span></div>
-      ${gaps(r)}<span class="tag rec">recording</span><button data-cancel="${esc(r.id)}" data-what="Stop recording">Stop</button></div>`).join("")
+      ${conflict(r)}${gaps(r)}<span class="tag rec">recording</span><button data-cancel="${esc(r.id)}" data-what="Stop recording">Stop</button></div>`).join("")
     : `<div class="empty">Nothing is recording.</div>`;
   $("#tuner").innerHTML = d.channels.length ? d.channels.map(c => `<div class="item"><div class="grow"><b>${esc(c.num)} ${esc(c.name)}</b>
       <span class="dim">${[c.recordings.length ? `recording ${c.recordings.map(esc).join(", ")}` : "", c.viewers ? `${c.viewers} watching` : ""].filter(Boolean).join(" · ") || "closing"}</span></div>
@@ -80,12 +83,12 @@ async function draw() {
     : `<div class="empty">No channels open. One tuner connection per channel is shared by everyone watching or recording it.</div>`;
   $("#next").innerHTML = next.length ? next.map(r => `<div class="item"><div class="grow"><b>${title(r)}</b>
       <span class="dim">${when(r.start)} – ${time(ends(r))} · ${esc(r.channel)} ${esc(r.channel_name)}</span></div>
-      <button data-cancel="${esc(r.id)}" data-what="Cancel">Cancel</button></div>`).join("")
+      ${conflict(r)}<button data-cancel="${esc(r.id)}" data-what="Cancel">Cancel</button></div>`).join("")
     : `<div class="empty">Nothing scheduled. Press Record on a show in Jellyfin's guide.</div>`;
   const tags = { done: "good", missed: "warn", failed: "rec", cancelled: "dim", stopped: "dim" };
   $("#done").innerHTML = done.length ? done.map(r => `<div class="item"><div class="grow"><b>${title(r)}</b>
       <span class="dim">${when(r.start)} · ${esc(r.channel)} ${esc(r.channel_name)} · <span class="mono">${gb(r.bytes)}</span></span></div>
-      ${gaps(r)}<span class="tag ${tags[r.status] || "dim"}">${esc(r.status)}</span></div>`).join("")
+      ${gaps(r)}<span class="tag ${tags[r.status] || "dim"}" title="${esc(r.reason || "")}">${esc(r.status)}${r.reason ? ": " + esc(r.reason) : ""}</span></div>`).join("")
     : `<div class="empty">Nothing yet.</div>`;
 }
 

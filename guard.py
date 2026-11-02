@@ -50,6 +50,7 @@ PORT = int(os.environ.get("PORT", "8000"))
 POLL = float(os.environ.get("POLL_SECONDS", "15"))
 LINGER = float(os.environ.get("LINGER", "10"))     # keep a channel tuned this long after its last user
 EXTRA = timedelta(minutes=float(os.environ.get("EXTRA_MINUTES", "0")))  # added to every recording's end
+TUNER_COUNT = os.environ.get("TUNER_COUNT", "").strip()  # optional: else asked from an HDHomeRun
 GAP = 10                                            # seconds without data that count as a gap
 MATCH = timedelta(hours=3)                          # how far a moved show is looked for in the guide
 PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "page.html")
@@ -418,13 +419,14 @@ def label(rec):
 
 
 def record(rec):
-    """Write the channel's stream to the file until the slot ends, through the hub."""
-    begin, stop = window(rec)
+    """Write the channel's stream to the file until the slot ends, through the hub. The file
+    (and its .nfo) is only created once data arrives, so a recording that never gets a tuner
+    leaves nothing behind in the library."""
     ch = HUB.channel(rec["channel"])
     if ch is None:
         log(f"channel {rec['channel']} isn't in the tuner's lineup, can't record {label(rec)}")
         with STORE.lock:
-            rec["status"] = "failed"
+            rec.update(status="failed", reason="channel not in the tuner's lineup", finished=iso(now()))
             STORE.save()
         return
     path = rec.get("path")
@@ -434,49 +436,107 @@ def record(rec):
         except Exception as exc:  # Jellyfin unreachable: still record, in a folder of its own
             log(f"couldn't ask Jellyfin for its recording folders ({exc}), recording to the top folder")
             path = rec["path"] = os.path.join(RECORD_DIR, safe(f"{label(rec)} {parse_time(rec['start']).astimezone():%Y-%m-%d %H.%M}") + ".ts")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    write_nfo(rec, path)
     sub = Sub("recording", label(rec))
     ch.add(sub)
-    log(f"recording {label(rec)} on {ch.num} {ch.name} until {local(stop)} -> {path}")
-    tell_jellyfin(path, "Created")
-    last, gap_from = time.time(), None
+    log(f"recording {label(rec)} on {ch.num} {ch.name} until {local(window(rec)[1])} -> {path}")
+    out, last, gap_from = None, time.time(), None
     try:
-        with open(path, "ab") as out:
-            while now() < stop and rec["status"] == "recording":
-                try:
-                    data = sub.q.get(timeout=2)
-                except queue.Empty:
-                    data = b""
-                if data is None:
-                    break
-                t = time.time()
-                if data:
-                    if gap_from is not None:
-                        secs = round(t - gap_from)
-                        rec.setdefault("gaps", []).append([datetime.fromtimestamp(gap_from, timezone.utc).isoformat(), secs])
-                        log(f"{label(rec)}: stream back after a {secs}s gap")
-                        gap_from = None
-                        STORE.save()
-                    out.write(data)
-                    rec["bytes"] = rec.get("bytes", 0) + len(data)
-                    last = t
-                elif gap_from is None and t - last > GAP:
-                    gap_from = last
-                    log(f"{label(rec)}: no data for {GAP}s, waiting for the tuner")
+        while now() < window(rec)[1] and rec["status"] == "recording":  # the end can move (live games)
+            try:
+                data = sub.q.get(timeout=2)
+            except queue.Empty:
+                data = b""
+            if data is None:
+                break
+            t = time.time()
+            if data:
+                if out is None:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    out = open(path, "ab")
+                    write_nfo(rec, path)
+                    tell_jellyfin(path, "Created")
+                if gap_from is not None:
+                    secs = round(t - gap_from)
+                    rec.setdefault("gaps", []).append([datetime.fromtimestamp(gap_from, timezone.utc).isoformat(), secs])
+                    log(f"{label(rec)}: stream back after a {secs}s gap")
+                    gap_from = None
+                    STORE.save()
+                out.write(data)
+                rec["bytes"] = rec.get("bytes", 0) + len(data)
+                last = t
+            elif gap_from is None and t - last > GAP:
+                gap_from = last
+                log(f"{label(rec)}: no data for {GAP}s, waiting for a tuner")
     finally:
         ch.remove(sub)
+        if out:
+            out.close()
         with STORE.lock:
             if gap_from is not None:
                 rec.setdefault("gaps", []).append([datetime.fromtimestamp(gap_from, timezone.utc).isoformat(),
                                                    round(time.time() - gap_from)])
-            if rec["status"] == "recording":
+            if not rec.get("bytes") and not os.path.exists(path):
+                if rec["status"] == "recording":
+                    rec.update(status="missed", reason="no free tuner the whole time")
+            elif rec["status"] == "recording":
                 rec["status"] = "done"
             rec["finished"] = iso(now())
             STORE.save()
     gaps = sum(g[1] for g in rec.get("gaps", []))
+    if rec["status"] == "missed":
+        log(f"missed {label(rec)}: no free tuner the whole time")
+        return
     log(f"finished {label(rec)}: {rec.get('bytes', 0) / 1e9:.2f} GB" + (f", {gaps}s missing" if gaps else ""))
     tell_jellyfin(path, "Modified")
+
+
+_tuners = {}
+
+
+def tuner_count():
+    """How many tuners the source has: TUNER_COUNT, or an HDHomeRun's discover.json. None if unknown."""
+    if TUNER_COUNT:
+        return int(TUNER_COUNT)
+    if "n" not in _tuners or time.monotonic() - _tuners["at"] > 3600:
+        n = None
+        try:
+            u = urllib.parse.urlsplit(SOURCE_M3U)
+            with urllib.request.urlopen(f"{u.scheme}://{u.netloc}/discover.json", timeout=10) as resp:
+                n = int(json.load(resp).get("TunerCount") or 0) or None
+        except Exception:
+            pass
+        if n is None and _tuners.get("n") is None and "at" not in _tuners:
+            log("couldn't tell how many tuners there are (set TUNER_COUNT), so overlaps aren't checked")
+        _tuners.update(n=n, at=time.monotonic())
+    return _tuners["n"]
+
+
+def check_conflicts():
+    """Flag recordings that overlap with more other channels than there are tuners. Recordings
+    on the same channel share a tuner, so it's channels that count. Padding is included."""
+    tuners = tuner_count()
+    with STORE.lock:
+        recs = [r for r in STORE.recs.values() if r["status"] in ("scheduled", "recording")]
+        found = {}
+        if tuners:
+            spans = [(window(r), r) for r in recs]
+            for (b, _), r in spans:  # a slot is over-booked if, at some start, too many channels are on
+                on = [x for (b2, e2), x in spans if b2 <= b < e2]
+                if len({x["channel"] for x in on}) > tuners:
+                    note = (f"{local(b)}: {len({x['channel'] for x in on})} channels at once, "
+                            f"{tuners} tuners")
+                    for x in on:
+                        found.setdefault(x["id"], note)
+        changed = False
+        for r in recs:
+            note = found.get(r["id"])
+            if note != r.get("conflict"):
+                if note:
+                    log(f"too many recordings at once: {label(r)} ({note})")
+                r["conflict"] = note
+                changed = True
+        if changed:
+            STORE.save()
 
 
 def from_timer(t):
@@ -520,6 +580,7 @@ def take_over():
             STORE.save()
         log(f"took over {label(rec)} on {rec['channel']} {rec['channel_name']}, {local(parse_time(rec['start']))}"
             + (" (Jellyfin was recording it)" if t.get("Status") == "InProgress" else ""))
+        check_conflicts()
 
 
 def follow_guide():
@@ -549,8 +610,14 @@ def follow_guide():
 
 def scheduler():
     """Start recordings on time (and any that were running when the service stopped)."""
-    threads = {}
+    threads, checked = {}, 0.0
     while True:
+        if time.monotonic() - checked > 60:  # cancels, guide moves and finished recordings change overlaps
+            checked = time.monotonic()
+            try:
+                check_conflicts()
+            except Exception as exc:
+                log(f"couldn't check for overlaps: {exc}")
         with STORE.lock:
             for rid, rec in list(STORE.recs.items()):
                 begin, stop = window(rec)
