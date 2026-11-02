@@ -1,43 +1,61 @@
 # dvr-guard
 
-Keeps Jellyfin's one-time Live TV recordings from disappearing.
+Records live TV for Jellyfin, reliably, and shares one tuner per channel between recordings
+and viewers.
 
-Every time Jellyfin refreshes the guide, it deletes any one-time recording whose program it
-can't find in the new guide, for example because the listing's start time moved by a minute.
-It does this without a message, so the recording just never happens.
+Jellyfin's own recordings have two problems:
+- A recording shares the live-TV stream with anyone watching the same channel, and Jellyfin
+  closes that stream when the viewers leave, even while it's recording. The recording just
+  stops.
+- Every guide refresh deletes one-time recordings whose program it can't find any more (for
+  example because the start time moved a minute), without a message.
 
-dvr-guard keeps its own list of every one-time recording you schedule in Jellyfin. When one
-disappears during a guide refresh, it finds the same show in the new guide (same channel and
-title, nearest start time) and schedules it again in Jellyfin with your original padding.
-If the show is gone from the guide entirely, it records the saved time slot itself, straight
-from the tuner, into your recordings folder.
+## How it works
+- **Tuner hub.** dvr-guard serves the tuner's channels as an M3U playlist. Jellyfin (and
+  anything else, like admute) uses it as its tuner. Each channel is pulled from the tuner
+  once, however many viewers and recordings use it, and reconnected within seconds if the
+  stream drops. If a recording needs a tuner and all are busy with viewers, a viewer-only
+  channel is stopped to free one.
+- **Recordings.** Press Record in Jellyfin as usual. Within a few seconds dvr-guard copies
+  the recording (channel, times, padding, title, description) into its own schedule and
+  removes it from Jellyfin's, so Jellyfin never records it itself. It records from the hub
+  into Jellyfin's recording folder with Jellyfin's file names and `.nfo` files, so it shows up
+  in the library as before. Viewers coming and going can't affect it. If the show moves in
+  the guide, the recording moves with it. Gaps (tuner trouble) are logged and shown.
+- **Status page** (formlogin sign-in): what's recording, what each channel is serving,
+  what's scheduled (with Cancel) and recent recordings with any missing seconds.
 
-Recordings you cancel in Jellyfin are left alone. Jellyfin only drops recordings while its
-"Refresh Guide" task runs, and only when the program left the guide, so anything else that
-disappears was a cancel.
-
-Series recordings ("Record Series") don't need this: Jellyfin rebuilds them from the guide
-on every refresh.
+Series recordings work too: each episode Jellyfin schedules from a series is taken over.
+Scheduled recordings therefore don't appear in Jellyfin's "Scheduled" list; see the status
+page.
 
 ## Setup
 1. In Jellyfin: Dashboard > API Keys > +, name it `dvr-guard`.
-2. `cp .env.example .env` and fill it in.
-3. `docker compose up -d`
+2. `cp .env.example .env` and fill it in (make the sign-in hash as it says).
+3. `docker compose up -d --build`
+4. In Jellyfin: Dashboard > Live TV > Tuner Devices: add an **M3U Tuner** with URL
+   `<PUBLIC_URL>/lineup.m3u` (e.g. `http://dvr-guard:8000/lineup.m3u`), then remove the
+   tuner's own entry (e.g. the HDHomeRun), so all live TV goes through the hub. The guide
+   matches the channels by number as before.
+5. Optionally put the status page behind your reverse proxy, e.g. Caddy
+   `handle_path /dvr/* { reverse_proxy dvr-guard:8000 }`. The playlist and streams only
+   answer requests that come straight from a private address, not through the proxy.
 
-Log: `docker logs -f dvr-guard`. Its list of recordings is in `data/recordings.json`.
+Log: `docker logs -f dvr-guard`. The schedule is in `data/schedule.json`. Restarting the
+service during a recording leaves a gap of a few seconds; it carries on afterwards.
 
 ## Settings (.env)
 - `JELLYFIN_URL`, `JELLYFIN_API_KEY`, `DOCKER_NETWORK`: how to reach Jellyfin.
-- `SOURCE_M3U`: the tuner's M3U playlist, used only for recording straight from the tuner.
-  Leave empty to skip that.
-- `RECORD_DIR`: where those recordings go (usually Jellyfin's recording folder).
-- `FALLBACK_EXTRA_MINUTES`: added to the end of tuner recordings, since sports run long.
-- `PUID`, `PGID`, `TZ`.
+- `SOURCE_M3U`: the tuner's M3U playlist (HDHomeRun: `http://<ip>/lineup.m3u`).
+- `PUBLIC_URL`: this service's address as Jellyfin sees it, used in the playlist.
+- `RECORD_DIR`: the host folder Jellyfin records into (its Live TV recording path).
+- `PUID`, `PGID`, `EXTRA_GID` (a group that can write to `RECORD_DIR`), `TZ`.
+- `EXTRA_MINUTES`: added to every recording's end on top of Jellyfin's padding.
+- `DVR_USERNAME`, `DVR_PASSWORD_HASH`: status page sign-in.
 
-Optional, in the environment: `POLL_SECONDS` (30), `MATCH_HOURS` (how far from the old start
-to look for the show, 3), `DRY_RUN=1` (log what it would do without doing it).
+Optional, in the environment: `POLL_SECONDS` (how often Jellyfin is checked, 15),
+`LINGER` (seconds a channel stays tuned after its last user, 10).
 
 ## Limits
-- Tuner recordings don't get Jellyfin's metadata until the library rescans the folder.
-- If you cancel a recording at the same moment a guide refresh removes that program,
-  dvr-guard can't tell the two apart and will put it back.
+- Jellyfin's series options like "keep up to N episodes" aren't applied.
+- Two recordings at once on a two-tuner device leave no tuner for watching other channels.

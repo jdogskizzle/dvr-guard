@@ -1,22 +1,34 @@
-# Keeps Jellyfin's one-time Live TV recordings from being lost on a guide refresh.
-# Settings come from .env (copy .env.example to .env and fill it in).
+# dvr-guard: records live TV itself and shares one tuner per channel between recordings and
+# viewers. Settings come from .env (copy .env.example to .env and fill it in).
 services:
   dvr-guard:
-    image: python:3.12-alpine
+    build:
+      context: .
+      additional_contexts:
+        formlogin: ${FORMLOGIN_SRC:-https://github.com/jdogskizzle/formlogin.git#v1.0.0}   # sign-in library; FORMLOGIN_SRC=<folder> to build from a local copy
+    image: dvr-guard:local
     container_name: dvr-guard
     restart: unless-stopped
     user: "${PUID:?set PUID in .env}:${PGID:?set PGID in .env}"
-    command: ["python", "-u", "/app/guard.py"]
+    group_add:
+      - "${EXTRA_GID:-${PGID}}"   # a group that can write to RECORD_DIR, if it's not PGID
     environment:
       - JELLYFIN_URL=${JELLYFIN_URL:?set JELLYFIN_URL in .env}
       - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:?set JELLYFIN_API_KEY in .env}
-      - SOURCE_M3U=${SOURCE_M3U:-}
-      - FALLBACK_EXTRA_MINUTES=${FALLBACK_EXTRA_MINUTES:-30}
+      - SOURCE_M3U=${SOURCE_M3U:?set SOURCE_M3U in .env}
+      - PUBLIC_URL=${PUBLIC_URL:?set PUBLIC_URL in .env}
+      - EXTRA_MINUTES=${EXTRA_MINUTES:-0}
+      - DVR_USERNAME=${DVR_USERNAME:-}
+      - DVR_PASSWORD_HASH=${DVR_PASSWORD_HASH:-}
       - TZ=${TZ:-UTC}
     volumes:
       - ./guard.py:/app/guard.py:ro
+      - ./page.html:/app/page.html:ro
       - ./data:/data
       - ${RECORD_DIR:?set RECORD_DIR in .env}:/recordings
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/lineup.m3u', timeout=10)"]
+      interval: 60s
     networks:
       - jellyfin
 

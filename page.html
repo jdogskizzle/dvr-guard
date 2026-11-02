@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DVR</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%23e0484f'/></svg>">
+<style>
+:root { --bg: #f5f4f1; --panel: #fff; --panel2: #efeee9; --line: #dddbd3; --text: #1e1d1a; --dim: #6b685f;
+        --rec: #d63a3f; --good: #2e8b57; --warn: #c27a12; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #141412; --panel: #1d1c1a; --panel2: #252421; --line: #34322e; --text: #ecebe6; --dim: #9a978d;
+          --rec: #ef5b5f; --good: #5cc27d; --warn: #e3a54e; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+header h1 { font-size: 16px; margin: 0; flex: 1; display: flex; align-items: center; gap: 8px; }
+header h1 i { width: 11px; height: 11px; border-radius: 50%; background: var(--rec); }
+main { max-width: 900px; margin: 0 auto; padding: 16px 16px 50px; }
+h2 { font-size: 15px; margin: 22px 0 8px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.item { display: flex; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); align-items: center; }
+.item:last-child { border-bottom: none; }
+.item .grow { flex: 1; min-width: 0; }
+.item b { display: block; }
+.dim { color: var(--dim); font-size: 13px; }
+.tag { font-size: 12px; padding: 1px 7px; border-radius: 4px; border: 1px solid currentColor; white-space: nowrap; }
+.tag.rec { color: var(--rec); } .tag.good { color: var(--good); } .tag.warn { color: var(--warn); } .tag.dim { color: var(--dim); }
+button { font: inherit; color: inherit; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+.empty { padding: 18px 14px; color: var(--dim); }
+.mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+p.note { color: var(--dim); font-size: 13px; }
+</style>
+</head>
+<body>
+<header><h1><i></i>DVR</h1><form method="post" action="logout"><button>Sign out</button></form></header>
+<main>
+  <p class="note">Press Record in Jellyfin as usual: recordings move here within a few seconds and are recorded from the tuner hub, so watching the same channel can't interrupt them.</p>
+  <h2>Recording now</h2><div class="card" id="now"></div>
+  <h2>Tuner</h2><div class="card" id="tuner"></div>
+  <h2>Scheduled</h2><div class="card" id="next"></div>
+  <h2>Recent</h2><div class="card" id="done"></div>
+</main>
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const when = s => new Date(s).toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+const time = s => new Date(s).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+const gb = b => b ? (b / 1e9).toFixed(1) + " GB" : "";
+const title = r => esc(r.name) + (r.episode ? ` <span class="dim">· ${esc(r.episode)}</span>` : "");
+const ends = r => new Date(new Date(r.end).getTime() + (r.post || 0) * 1000).toISOString();
+
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+  if (r.status === 401) { location.href = "login"; throw new Error("signed out"); }
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+  return r.json();
+}
+
+function gaps(r) {
+  const g = (r.gaps || []).reduce((a, x) => a + x[1], 0);
+  return g ? `<span class="tag warn" title="${(r.gaps || []).map(x => `${time(x[0])}: ${x[1]}s`).join(", ")}">${g}s missing</span>` : "";
+}
+
+async function draw() {
+  const d = await api("api/status");
+  const recs = d.recordings;
+  const rec = recs.filter(r => r.status === "recording");
+  const next = recs.filter(r => r.status === "scheduled");
+  const done = recs.filter(r => !["recording", "scheduled"].includes(r.status)).reverse().slice(0, 30);
+  $("#now").innerHTML = rec.length ? rec.map(r => `<div class="item"><div class="grow"><b>${title(r)}</b>
+      <span class="dim">${esc(r.channel)} ${esc(r.channel_name)} · until ${time(ends(r))} · <span class="mono">${gb(r.bytes)}</span></span></div>
+      ${gaps(r)}<span class="tag rec">recording</span><button data-cancel="${esc(r.id)}" data-what="Stop recording">Stop</button></div>`).join("")
+    : `<div class="empty">Nothing is recording.</div>`;
+  $("#tuner").innerHTML = d.channels.length ? d.channels.map(c => `<div class="item"><div class="grow"><b>${esc(c.num)} ${esc(c.name)}</b>
+      <span class="dim">${[c.recordings.length ? `recording ${c.recordings.map(esc).join(", ")}` : "", c.viewers ? `${c.viewers} watching` : ""].filter(Boolean).join(" · ") || "closing"}</span></div>
+      <span class="tag ${c.connected ? "good" : "warn"}">${c.connected ? "tuned" : "connecting"}</span></div>`).join("")
+    : `<div class="empty">No channels open. One tuner connection per channel is shared by everyone watching or recording it.</div>`;
+  $("#next").innerHTML = next.length ? next.map(r => `<div class="item"><div class="grow"><b>${title(r)}</b>
+      <span class="dim">${when(r.start)} – ${time(ends(r))} · ${esc(r.channel)} ${esc(r.channel_name)}</span></div>
+      <button data-cancel="${esc(r.id)}" data-what="Cancel">Cancel</button></div>`).join("")
+    : `<div class="empty">Nothing scheduled. Press Record on a show in Jellyfin's guide.</div>`;
+  const tags = { done: "good", missed: "warn", failed: "rec", cancelled: "dim", stopped: "dim" };
+  $("#done").innerHTML = done.length ? done.map(r => `<div class="item"><div class="grow"><b>${title(r)}</b>
+      <span class="dim">${when(r.start)} · ${esc(r.channel)} ${esc(r.channel_name)} · <span class="mono">${gb(r.bytes)}</span></span></div>
+      ${gaps(r)}<span class="tag ${tags[r.status] || "dim"}">${esc(r.status)}</span></div>`).join("")
+    : `<div class="empty">Nothing yet.</div>`;
+}
+
+document.addEventListener("click", async e => {
+  const b = e.target.closest("[data-cancel]");
+  if (!b || !confirm(b.dataset.what + "?")) return;
+  try { await api("api/cancel", { id: b.dataset.cancel }); draw(); } catch (err) { alert(err.message); }
+});
+draw(); setInterval(draw, 5000);
+</script>
+</body>
+</html>
