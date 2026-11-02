@@ -22,6 +22,15 @@ Jellyfin's own recordings have two problems:
   into Jellyfin's recording folder with Jellyfin's file names and `.nfo` files, so it shows up
   in the library as before. Viewers coming and going can't affect it. If the show moves in
   the guide, the recording moves with it. Gaps (tuner trouble) are logged and shown.
+- **Games.** A recording whose listing names two teams ("Chicago Bears at Seattle
+  Seahawks") is matched to the game on ESPN's public scoreboard. While the game is live it
+  keeps recording past its slot (up to `GAME_MAX_HOURS`), and it stops `FINAL_MINUTES`
+  after the game is final, padding or not, which frees the tuner early.
+- **Too many at once.** When more channels need recording at the same time than there are
+  tuners (padding included), the recordings are flagged on the status page as soon as
+  they're scheduled. If it still happens, what's already recording carries on and the
+  later one starts when a tuner frees up, with the missing part noted. One that never gets
+  a tuner is marked missed and leaves no file behind.
 - **Status page** (formlogin sign-in): what's recording, what each channel is serving,
   what's scheduled (with Cancel) and recent recordings with any missing seconds.
 
@@ -31,7 +40,7 @@ page.
 
 ## Setup
 1. In Jellyfin: Dashboard > API Keys > +, name it `dvr-guard`.
-2. `cp .env.example .env` and fill it in (make the sign-in hash as it says).
+2. `cp .env.example .env` and fill it in.
 3. `docker compose up -d --build`
 4. In Jellyfin: Dashboard > Live TV > Tuner Devices: add an **M3U Tuner** with URL
    `<PUBLIC_URL>/lineup.m3u` (e.g. `http://dvr-guard:8000/lineup.m3u`), then remove the
@@ -51,10 +60,16 @@ service during a recording leaves a gap of a few seconds; it carries on afterwar
 - `RECORD_DIR`: the host folder Jellyfin records into (its Live TV recording path).
 - `PUID`, `PGID`, `EXTRA_GID` (a group that can write to `RECORD_DIR`), `TZ`.
 - `EXTRA_MINUTES`: added to every recording's end on top of Jellyfin's padding.
-- `DVR_USERNAME`, `DVR_PASSWORD_HASH`: status page sign-in.
+- `DVR_USERNAME`: optional, fixes the status page's login name. Set the password with
+  `docker compose exec dvr-guard python -m formlogin passwd` (saved in `data/login.json`,
+  used right away), or on first start on the setup page, with the code from `docker logs dvr-guard`.
+
+- `TUNER_COUNT`: how many tuners the source has, for the overlap warning. Leave empty for
+  an HDHomeRun (it's asked).
 
 Optional, in the environment: `POLL_SECONDS` (how often Jellyfin is checked, 15),
-`LINGER` (seconds a channel stays tuned after its last user, 10).
+`LINGER` (seconds a channel stays tuned after its last user, 10), `GAMES=0` (don't follow
+games), `FINAL_MINUTES` (5), `GAME_MAX_HOURS` (2).
 
 ## Limits
 - Jellyfin's series options like "keep up to N episodes" aren't applied.

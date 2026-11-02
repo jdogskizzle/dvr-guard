@@ -50,6 +50,11 @@ PORT = int(os.environ.get("PORT", "8000"))
 POLL = float(os.environ.get("POLL_SECONDS", "15"))
 LINGER = float(os.environ.get("LINGER", "10"))     # keep a channel tuned this long after its last user
 EXTRA = timedelta(minutes=float(os.environ.get("EXTRA_MINUTES", "0")))  # added to every recording's end
+# Sports: follow the game's live status (ESPN's public scoreboard) to keep recording while it
+# runs long and stop soon after it ends. GAMES=0 turns it off.
+GAMES = os.environ.get("GAMES", "1") not in ("0", "", "false")
+FINAL_MINUTES = float(os.environ.get("FINAL_MINUTES", "5"))     # keep recording this long after "final"
+GAME_MAX_HOURS = float(os.environ.get("GAME_MAX_HOURS", "2"))   # longest a live game extends past its slot
 TUNER_COUNT = os.environ.get("TUNER_COUNT", "").strip()  # optional: else asked from an HDHomeRun
 GAP = 10                                            # seconds without data that count as a gap
 MATCH = timedelta(hours=3)                          # how far a moved show is looked for in the guide
@@ -410,8 +415,10 @@ STORE = None
 
 
 def window(rec):
+    """(begin, stop) of the recording. A followed game sets its own stop (stop_at)."""
     start, end = parse_time(rec["start"]), parse_time(rec["end"])
-    return start - timedelta(seconds=rec.get("pre", 0)), end + timedelta(seconds=rec.get("post", 0)) + EXTRA
+    stop = parse_time(rec.get("stop_at")) or end + timedelta(seconds=rec.get("post", 0)) + EXTRA
+    return start - timedelta(seconds=rec.get("pre", 0)), stop
 
 
 def label(rec):
@@ -537,6 +544,107 @@ def check_conflicts():
                 changed = True
         if changed:
             STORE.save()
+
+
+# --- following games -----------------------------------------------------------
+
+# Guide titles and the ESPN scoreboard they're on. Unknown sports titles try them all.
+LEAGUES = {
+    "nfl": "football/nfl", "college football": "football/college-football", "nhl": "hockey/nhl",
+    "hockey": "hockey/nhl", "nba": "basketball/nba", "wnba": "basketball/wnba",
+    "college basketball": "basketball/mens-college-basketball", "mlb": "baseball/mlb",
+    "baseball": "baseball/mlb", "mls": "soccer/usa.1",
+}
+LIVE = {"STATUS_IN_PROGRESS", "STATUS_HALFTIME", "STATUS_END_PERIOD", "STATUS_DELAYED", "STATUS_RAIN_DELAY",
+        "STATUS_OVERTIME", "STATUS_SHOOTOUT", "STATUS_FIRST_HALF", "STATUS_SECOND_HALF"}
+_boards = {}
+
+
+def scoreboard(league, day):
+    key = (league, day)
+    hit = _boards.get(key)
+    if not hit or time.monotonic() - hit[0] > 45:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/{league}/scoreboard?dates={day:%Y%m%d}"
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            hit = _boards[key] = (time.monotonic(), json.load(resp).get("events", []))
+    return hit[1]
+
+
+def words(s):
+    return set(re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower()).split())
+
+
+def find_game(rec):
+    """The scoreboard event for a recording whose episode title names two teams, or None."""
+    title = rec.get("episode") or ""
+    if not re.search(r"\b(at|vs\.?|v\.?)\b|@", title, re.I):
+        return None
+    name = (rec.get("name") or "").lower()
+    leagues = [v for k, v in LEAGUES.items() if k in name] or list(dict.fromkeys(LEAGUES.values()))
+    start = parse_time(rec["start"]).astimezone()
+    tw = words(title)
+    for league in leagues:
+        for day in {start.date(), (start - timedelta(days=1)).date()}:
+            try:
+                events = scoreboard(league, day)
+            except Exception:
+                continue
+            for e in events:
+                teams = [c.get("team", {}) for c in e.get("competitions", [{}])[0].get("competitors", [])]
+                if len(teams) == 2 and all(words(t.get("displayName")) <= tw or words(t.get("shortDisplayName")) <= tw
+                                           for t in teams):
+                    return league, e
+    return None
+
+
+def follow_games():
+    """For recordings of games: extend while the game is live, stop FINAL_MINUTES after it ends."""
+    with STORE.lock:
+        recs = [r for r in STORE.recs.values() if r["status"] == "recording" and r.get("game") is not False]
+    for rec in recs:
+        try:
+            found = find_game(rec)
+        except Exception as exc:
+            log(f"couldn't check the game for {label(rec)}: {exc}")
+            continue
+        if not found:
+            if "game" not in rec:
+                rec["game"] = False  # not a game we can follow: normal padding
+            continue
+        league, e = found
+        st = e["status"]["type"]
+        _, end = parse_time(rec["start"]), parse_time(rec["end"])
+        normal = end + timedelta(seconds=rec.get("post", 0)) + EXTRA
+        with STORE.lock:
+            first = not rec.get("game")
+            rec["game"] = {"league": league, "id": e.get("id"), "status": st.get("name"),
+                           "detail": st.get("shortDetail") or st.get("detail")}
+            if first:
+                log(f"{label(rec)}: following the game on ESPN ({league})")
+            if st.get("name") == "STATUS_FINAL" or st.get("completed"):
+                if not rec.get("final_at"):
+                    rec["final_at"] = iso(now())
+                    rec["stop_at"] = iso(now() + timedelta(minutes=FINAL_MINUTES))
+                    log(f"{label(rec)}: game over ({st.get('detail')}), stopping at {local(parse_time(rec['stop_at']))}")
+            elif st.get("name") in LIVE:
+                want = max(normal, now() + timedelta(minutes=15))
+                cap = end + timedelta(hours=GAME_MAX_HOURS)
+                stop_at = min(want, cap)
+                if stop_at > (parse_time(rec.get("stop_at")) or normal) + timedelta(minutes=1):
+                    if not rec.get("stop_at"):
+                        log(f"{label(rec)}: game still on ({st.get('shortDetail')}), recording past the slot")
+                    rec["stop_at"] = iso(stop_at)
+            STORE.save()
+
+
+def games_loop():
+    while True:
+        if GAMES:
+            try:
+                follow_games()
+            except Exception as exc:
+                log(f"couldn't follow games: {exc}")
+        time.sleep(60)
 
 
 def from_timer(t):
@@ -702,7 +810,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.stream(urllib.parse.unquote(path[8:]))
         if path == "/api/status":
             with STORE.lock:
-                recs = sorted(STORE.recs.values(), key=lambda r: r["start"])
+                recs = sorted(({**r, "until": iso(window(r)[1])} for r in STORE.recs.values()), key=lambda r: r["start"])
             return self.send(200, {"recordings": recs, "channels": HUB.status(), "now": iso(now())})
         self.send(404, {"error": "not found"})
 
@@ -772,8 +880,8 @@ def main():
     global STORE, LOGIN
     os.makedirs(DATA, exist_ok=True)
     STORE = Store()
-    LOGIN = formlogin.Login.from_env(  # DVR_USERNAME, DVR_PASSWORD_HASH, DVR_AUTH
-        "DVR", "dvr-guard", os.path.join(DATA, "session.key"), title="DVR", is_public=public,
+    LOGIN = formlogin.Login.from_env(  # password: python -m formlogin passwd (see README)
+        "DVR", "dvr-guard", DATA, title="DVR", is_public=public,
         accent=("#2f6fb4", "#6aa7ec"),
         icon="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%23e0484f'/></svg>")
     try:
@@ -782,6 +890,7 @@ def main():
         log(f"can't read SOURCE_M3U yet ({exc}); will retry when asked")
     threading.Thread(target=scheduler, daemon=True, name="scheduler").start()
     threading.Thread(target=jellyfin_loop, daemon=True, name="jellyfin").start()
+    threading.Thread(target=games_loop, daemon=True, name="games").start()
     ThreadingHTTPServer.daemon_threads = True
     ThreadingHTTPServer(("", PORT), Handler).serve_forever()
 

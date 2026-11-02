@@ -50,7 +50,8 @@ const when = s => new Date(s).toLocaleString([], { weekday: "short", month: "sho
 const time = s => new Date(s).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 const gb = b => b ? (b / 1e9).toFixed(1) + " GB" : "";
 const title = r => esc(r.name) + (r.episode ? ` <span class="dim">· ${esc(r.episode)}</span>` : "");
-const ends = r => new Date(new Date(r.end).getTime() + (r.post || 0) * 1000).toISOString();
+const ends = r => r.until || new Date(new Date(r.end).getTime() + (r.post || 0) * 1000).toISOString();
+const game = r => r.game ? `<span class="tag ${r.game.status === "STATUS_FINAL" ? "good" : "warn"}" title="followed on ESPN: recording continues while the game is on and stops ${""}soon after it ends">${esc(r.game.detail || r.game.status)}</span>` : "";
 
 async function api(path, body) {
   const r = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
@@ -75,7 +76,7 @@ async function draw() {
   const done = recs.filter(r => !["recording", "scheduled"].includes(r.status)).reverse().slice(0, 30);
   $("#now").innerHTML = rec.length ? rec.map(r => `<div class="item"><div class="grow"><b>${title(r)}</b>
       <span class="dim">${esc(r.channel)} ${esc(r.channel_name)} · until ${time(ends(r))} · <span class="mono">${gb(r.bytes)}</span></span></div>
-      ${conflict(r)}${gaps(r)}<span class="tag rec">recording</span><button data-cancel="${esc(r.id)}" data-what="Stop recording">Stop</button></div>`).join("")
+      ${game(r)}${conflict(r)}${gaps(r)}<span class="tag rec">recording</span><button data-cancel="${esc(r.id)}" data-what="Stop recording">Stop</button></div>`).join("")
     : `<div class="empty">Nothing is recording.</div>`;
   $("#tuner").innerHTML = d.channels.length ? d.channels.map(c => `<div class="item"><div class="grow"><b>${esc(c.num)} ${esc(c.name)}</b>
       <span class="dim">${[c.recordings.length ? `recording ${c.recordings.map(esc).join(", ")}` : "", c.viewers ? `${c.viewers} watching` : ""].filter(Boolean).join(" · ") || "closing"}</span></div>
